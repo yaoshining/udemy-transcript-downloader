@@ -24,46 +24,49 @@ if (!fs.existsSync(outputDir)) {
   fs.mkdirSync(outputDir, { recursive: true });
 }
 
-// Parse command line arguments for --languages / -l flag
-function parseLanguages(args) {
+// Parse a flag with a value (e.g., --flag value)
+function parseFlagValue(args, flag) {
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === '--languages' || args[i] === '-l') {
+    if (args[i] === flag) {
       const raw = args[i + 1];
-      if (!raw || raw.startsWith('-')) {
-        console.error('Error: --languages requires a comma-separated list of language codes');
-        console.error('Example: --languages en_GB,zh_CN');
-        process.exit(1);
-      }
-      return raw.split(',').map(s => s.trim()).filter(Boolean);
+      if (!raw || raw.startsWith('-')) return null;
+      return raw;
     }
   }
   return null;
 }
 
+// Check if a boolean flag exists (e.g., --flag)
+function hasFlag(args, flag) {
+  return args.includes(flag);
+}
+
+// Parse command line arguments for --languages / -l flag
+function parseLanguages(args) {
+  const raw = parseFlagValue(args, '--languages') || parseFlagValue(args, '-l');
+  if (raw === null) return null;
+  return raw.split(',').map(s => s.trim()).filter(Boolean);
+}
+
 // Get positional arguments (skip node, script name, and flag arguments)
 function getCourseUrl(args) {
-  const positional = [];
+  const flagSet = new Set(['--languages', '-l', '--save-auth', '--load-auth']);
   let skipNext = false;
   for (let i = 2; i < args.length; i++) {
-    if (skipNext) {
-      skipNext = false;
-      continue;
-    }
-    if (args[i] === '--languages' || args[i] === '-l') {
-      skipNext = true;
-      continue;
-    }
-    if (!args[i].startsWith('-')) {
-      positional.push(args[i]);
-    }
+    if (skipNext) { skipNext = false; continue; }
+    if (flagSet.has(args[i])) { skipNext = true; continue; }
+    if (!args[i].startsWith('-')) return args[i];
   }
-  return positional[0] || null;
+  return null;
 }
 
 // Main function
 async function main() {
-  // Parse languages from CLI
+  // Parse CLI flags
   const languages = parseLanguages(process.argv);
+  const saveAuthPath = parseFlagValue(process.argv, '--save-auth');
+  const loadAuthPath = parseFlagValue(process.argv, '--load-auth');
+  const nonInteractive = hasFlag(process.argv, '--non-interactive');
 
   // Get course URL
   let courseUrl = getCourseUrl(process.argv);
@@ -73,7 +76,10 @@ async function main() {
     console.error('Please provide a Udemy course URL as a parameter');
     console.error('Example: npm start https://www.udemy.com/course/your-course-name');
     console.error('Options:');
-    console.error('  --languages, -l  Comma-separated language codes to download (e.g., en_GB,zh_CN)');
+    console.error('  --languages, -l    Comma-separated language codes (e.g., en_GB,zh_CN)');
+    console.error('  --save-auth <file>  Save login cookies to a JSON file after authentication');
+    console.error('  --load-auth <file>  Load login cookies from a JSON file to skip login');
+    console.error('  --non-interactive   Run without prompts (read inputs from env vars)');
     process.exit(1);
   }
 
@@ -87,11 +93,23 @@ async function main() {
     console.log(`Language filter: ${languages.join(', ')}`);
   }
 
-  // Auto-enable SRT download when languages are specified, otherwise ask
+  // Determine downloadSrt and tabCount based on mode
   let downloadSrt;
-  if (languages) {
+  let tabCount;
+
+  if (nonInteractive) {
+    downloadSrt = process.env.DOWNLOAD_SRT === 'true' || process.env.DOWNLOAD_SRT === '1';
+    tabCount = parseInt(process.env.TAB_COUNT || '5', 10);
+    console.log(`Non-interactive mode: downloadSrt=${downloadSrt}, tabCount=${tabCount}`);
+  } else if (languages) {
     downloadSrt = true;
     console.log('SRT download: enabled (languages specified)');
+    tabCount = await new Promise((resolve) => {
+      rl.question(`How many tabs do you want to use for downloading transcripts? (default is 5) [5]: `, (answer) => {
+        const normalized = answer.trim();
+        resolve(normalized ? parseInt(normalized, 10) : 5);
+      });
+    });
   } else {
     downloadSrt = await new Promise((resolve) => {
       rl.question('Do you want to download transcripts as .srt files with timestamps as well? (yes/no) [no]: ', (answer) => {
@@ -99,14 +117,39 @@ async function main() {
         resolve(normalized === 'yes' || normalized === 'y');
       });
     });
+    tabCount = await new Promise((resolve) => {
+      rl.question(`How many tabs do you want to use for downloading transcripts? (default is 5) [5]: `, (answer) => {
+        const normalized = answer.trim();
+        resolve(normalized ? parseInt(normalized, 10) : 5);
+      });
+    });
   }
 
-  const tabCount = await new Promise((resolve) => {
-    rl.question(`How many tabs do you want to use for downloading transcripts? (default is 5) [5]: `, (answer) => {
-      const normalized = answer.trim();
-      resolve(normalized ? parseInt(normalized, 10) : 5);
-    });
-  });
+  // Load auth cookies from file or UDEMY_AUTH env var
+  let authCookies = null;
+  if (loadAuthPath) {
+    console.log(`Loading auth cookies from: ${loadAuthPath}`);
+    if (!fs.existsSync(loadAuthPath)) {
+      console.error(`Auth file not found: ${loadAuthPath}`);
+      process.exit(1);
+    }
+    authCookies = JSON.parse(fs.readFileSync(loadAuthPath, 'utf8'));
+  } else if (process.env.UDEMY_AUTH) {
+    // Support loading from env var (for GitHub Actions secrets)
+    const authSource = process.env.UDEMY_AUTH;
+    if (fs.existsSync(authSource)) {
+      console.log(`Loading auth cookies from env var path: ${authSource}`);
+      authCookies = JSON.parse(fs.readFileSync(authSource, 'utf8'));
+    } else {
+      try {
+        console.log('Loading auth cookies from UDEMY_AUTH env var');
+        authCookies = JSON.parse(authSource);
+      } catch {
+        console.error('UDEMY_AUTH env var contains invalid JSON');
+        process.exit(1);
+      }
+    }
+  }
 
   // Launch browser in headless mode
   console.log('Launching browser...');
@@ -127,80 +170,107 @@ async function main() {
     const page = await browser.newPage();
     await new Promise(resolve => setTimeout(resolve, 1000));
 
-    // Navigate to login page
-    console.log('Navigating to login page...');
-    let loginPageLoaded = false;
-    for (let attempt = 0; attempt < 2 && !loginPageLoaded; attempt++) {
-      try {
-        await page.goto('https://www.udemy.com/join/passwordless-auth', { waitUntil: 'domcontentloaded' });
-        loginPageLoaded = true;
-      } catch (err) {
-        if (err.message.includes('frame was detached')) {
-          console.warn('Frame was detached, retrying navigation...');
-          await new Promise(resolve => setTimeout(resolve, 1000));
-        } else {
-          throw err;
+    if (authCookies) {
+      // Use saved auth cookies to skip login
+      console.log('Setting auth cookies...');
+      await page.setCookie(...authCookies);
+      console.log('Auth cookies loaded, skipping login.');
+
+      // Navigate to course page directly
+      console.log(`Navigating to course page: ${courseUrl}`);
+      await page.goto(courseUrl, { waitUntil: 'networkidle2' });
+    } else {
+      // Full login flow
+      // Navigate to login page
+      console.log('Navigating to login page...');
+      let loginPageLoaded = false;
+      for (let attempt = 0; attempt < 2 && !loginPageLoaded; attempt++) {
+        try {
+          await page.goto('https://www.udemy.com/join/passwordless-auth', { waitUntil: 'domcontentloaded' });
+          loginPageLoaded = true;
+        } catch (err) {
+          if (err.message.includes('frame was detached')) {
+            console.warn('Frame was detached, retrying navigation...');
+            await new Promise(resolve => setTimeout(resolve, 1000));
+          } else {
+            throw err;
+          }
         }
       }
-    }
 
-    // Check if email is configured
-    if (!process.env.UDEMY_EMAIL) {
-      console.error('UDEMY_EMAIL not found in .env file. Please configure your credentials.');
-      process.exit(1);
-    }
-
-    console.log('Processing login...');
-
-    // Wait a few seconds before filling the email input
-    await new Promise(resolve => setTimeout(resolve, 3000));
-
-    // Fill in the email input
-    await page.waitForSelector('input[name="email"]');
-    await page.type('input[name="email"]', process.env.UDEMY_EMAIL, { delay: 100 });
-
-    // Close the cookie bar if it exists
-    try {
-      // Check if cookie bar exists
-      const cookieButtonExists = await page.evaluate(() => {
-        return !!document.getElementById('onetrust-accept-btn-handler');
-      });
-
-      if (cookieButtonExists) {
-        await page.$eval('#onetrust-accept-btn-handler', element => element.click());
-        console.log('Closed cookie bar');
+      // Check if email is configured
+      if (!process.env.UDEMY_EMAIL) {
+        console.error('UDEMY_EMAIL not found in .env file. Please configure your credentials.');
+        process.exit(1);
       }
-    } catch (error) {
-      console.log('Cookie bar not found or could not be closed');
+
+      console.log('Processing login...');
+
+      // Wait a few seconds before filling the email input
+      await new Promise(resolve => setTimeout(resolve, 3000));
+
+      // Fill in the email input
+      await page.waitForSelector('input[name="email"]');
+      await page.type('input[name="email"]', process.env.UDEMY_EMAIL, { delay: 100 });
+
+      // Close the cookie bar if it exists
+      try {
+        const cookieButtonExists = await page.evaluate(() => {
+          return !!document.getElementById('onetrust-accept-btn-handler');
+        });
+        if (cookieButtonExists) {
+          await page.$eval('#onetrust-accept-btn-handler', element => element.click());
+          console.log('Closed cookie bar');
+        }
+      } catch (error) {
+        console.log('Cookie bar not found or could not be closed');
+      }
+
+      // Submit the login form
+      await page.$eval('[data-purpose="code-generation-form"] [type="submit"]', element => element.click());
+      console.log('Email submitted, waiting for verification code...');
+
+      // Get verification code
+      let verificationCode;
+      if (nonInteractive) {
+        verificationCode = process.env.UDEMY_VERIFICATION_CODE;
+        if (!verificationCode) {
+          console.error('UDEMY_VERIFICATION_CODE not set. Required in non-interactive mode when no auth cookies are provided.');
+          process.exit(1);
+        }
+        console.log('Using verification code from UDEMY_VERIFICATION_CODE env var');
+      } else {
+        console.log('You have 5 minutes to enter the verification code before the program times out.');
+        verificationCode = await new Promise((resolve) => {
+          rl.question('Please enter the 6-digit verification code from your email: ', (code) => {
+            resolve(code.trim());
+          });
+        });
+      }
+
+      // Fill in the verification code
+      await page.waitForSelector('[data-purpose="otp-text-area"] input', { timeout: 60000 });
+      await page.type('[data-purpose="otp-text-area"] input', verificationCode, { delay: 100 });
+
+      // Submit the verification form
+      await page.$eval('[data-purpose="otp-verification-form"] [type="submit"]', element => element.click());
+      console.log('Verification submitted, completing login...');
+
+      // Wait for redirect after successful login with a longer timeout
+      await new Promise(resolve => setTimeout(resolve, 5000));
+      console.log('Login successful!');
+
+      // Save auth cookies if requested
+      if (saveAuthPath) {
+        const cookies = await page.cookies();
+        fs.writeFileSync(saveAuthPath, JSON.stringify(cookies, null, 2), 'utf8');
+        console.log(`Auth cookies saved to: ${saveAuthPath}`);
+      }
+
+      // Navigate to course page
+      console.log(`Navigating to course page: ${courseUrl}`);
+      await page.goto(courseUrl, { waitUntil: 'networkidle2' });
     }
-
-    // Submit the login form
-    await page.$eval('[data-purpose="code-generation-form"] [type="submit"]', element => element.click());
-    console.log('Email submitted, waiting for verification code...');
-
-    // Ask user for verification code in terminal
-    console.log('You have 5 minutes to enter the verification code before the program times out.');
-    const verificationCode = await new Promise((resolve) => {
-      rl.question('Please enter the 6-digit verification code from your email: ', (code) => {
-        resolve(code.trim());
-      });
-    });
-
-    // Fill in the verification code
-    await page.waitForSelector('[data-purpose="otp-text-area"] input', { timeout: 60000 });
-    await page.type('[data-purpose="otp-text-area"] input', verificationCode, { delay: 100 });
-
-    // Submit the verification form
-    await page.$eval('[data-purpose="otp-verification-form"] [type="submit"]', element => element.click());
-    console.log('Verification submitted, completing login...');
-
-    // Wait for redirect after successful login with a longer timeout
-    await new Promise(resolve => setTimeout(resolve, 5000));
-    console.log('Login successful!');
-
-    // Navigate to course page
-    console.log(`Navigating to course page: ${courseUrl}`);
-    await page.goto(courseUrl, { waitUntil: 'networkidle2' });
 
     // Extract course ID
     console.log('Extracting course ID...');

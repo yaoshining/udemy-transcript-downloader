@@ -1,0 +1,58 @@
+name: Download Udemy Transcripts
+
+on:
+  workflow_dispatch:
+    inputs:
+      course_url:
+        description: 'Udemy course URL'
+        required: true
+        type: string
+      languages:
+        description: 'Language codes to download (comma-separated, e.g. en_GB,zh_CN)'
+        required: false
+        type: string
+        default: 'en_GB,zh_CN'
+      tab_count:
+        description: 'Number of parallel tabs for downloading'
+        required: false
+        type: number
+        default: 5
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Create auth file from secret
+        run: echo '${{ secrets.UDEMY_AUTH }}' > udemy-auth.json
+
+      - name: Download transcripts
+        env:
+          UDEMY_EMAIL: ${{ secrets.UDEMY_EMAIL }}
+          DOWNLOAD_SRT: 'true'
+          TAB_COUNT: ${{ inputs.tab_count }}
+        run: |
+          node src/index.js \
+            --load-auth udemy-auth.json \
+            --non-interactive \
+            --languages "${{ inputs.languages }}" \
+            "${{ inputs.course_url }}"
+
+      - name: Upload transcripts as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: udemy-transcripts
+          path: output/
+          retention-days: 7
