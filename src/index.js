@@ -24,17 +24,58 @@ if (!fs.existsSync(outputDir)) {
   fs.mkdirSync(outputDir, { recursive: true });
 }
 
+// Parse command line arguments for --languages / -l flag
+function parseLanguages(args) {
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--languages' || args[i] === '-l') {
+      const raw = args[i + 1];
+      if (!raw || raw.startsWith('-')) {
+        console.error('Error: --languages requires a comma-separated list of language codes');
+        console.error('Example: --languages en_GB,zh_CN');
+        process.exit(1);
+      }
+      return raw.split(',').map(s => s.trim()).filter(Boolean);
+    }
+  }
+  return null;
+}
+
+// Get positional arguments (skip node, script name, and flag arguments)
+function getCourseUrl(args) {
+  const positional = [];
+  let skipNext = false;
+  for (let i = 2; i < args.length; i++) {
+    if (skipNext) {
+      skipNext = false;
+      continue;
+    }
+    if (args[i] === '--languages' || args[i] === '-l') {
+      skipNext = true;
+      continue;
+    }
+    if (!args[i].startsWith('-')) {
+      positional.push(args[i]);
+    }
+  }
+  return positional[0] || null;
+}
+
 // Main function
 async function main() {
+  // Parse languages from CLI
+  const languages = parseLanguages(process.argv);
+
+  // Get course URL
+  let courseUrl = getCourseUrl(process.argv);
+
   // Check if URL is provided
-  if (process.argv.length < 3) {
+  if (!courseUrl) {
     console.error('Please provide a Udemy course URL as a parameter');
     console.error('Example: npm start https://www.udemy.com/course/your-course-name');
+    console.error('Options:');
+    console.error('  --languages, -l  Comma-separated language codes to download (e.g., en_GB,zh_CN)');
     process.exit(1);
   }
-
-  // Get course URL from command line argument
-  let courseUrl = process.argv[2];
 
   // Make sure URL ends with a trailing slash
   if (!courseUrl.endsWith('/')) {
@@ -42,13 +83,23 @@ async function main() {
   }
 
   console.log(`Course URL: ${courseUrl}`);
+  if (languages) {
+    console.log(`Language filter: ${languages.join(', ')}`);
+  }
 
-  const downloadSrt = await new Promise((resolve) => {
-    rl.question('Do you want to download transcripts as .srt files with timestamps as well? (yes/no) [no]: ', (answer) => {
-      const normalized = answer.trim().toLowerCase();
-      resolve(normalized === 'yes' || normalized === 'y');
+  // Auto-enable SRT download when languages are specified, otherwise ask
+  let downloadSrt;
+  if (languages) {
+    downloadSrt = true;
+    console.log('SRT download: enabled (languages specified)');
+  } else {
+    downloadSrt = await new Promise((resolve) => {
+      rl.question('Do you want to download transcripts as .srt files with timestamps as well? (yes/no) [no]: ', (answer) => {
+        const normalized = answer.trim().toLowerCase();
+        resolve(normalized === 'yes' || normalized === 'y');
+      });
     });
-  });
+  }
 
   const tabCount = await new Promise((resolve) => {
     rl.question(`How many tabs do you want to use for downloading transcripts? (default is 5) [5]: `, (answer) => {
@@ -210,7 +261,7 @@ async function main() {
 
     // Download transcripts
     console.log('Downloading transcripts...');
-    await downloadTranscripts(browser, courseUrl, courseStructure, downloadSrt, tabCount);
+    await downloadTranscripts(browser, courseUrl, courseStructure, downloadSrt, tabCount, languages);
 
     console.log('All transcripts have been downloaded successfully!');
   } catch (error) {
@@ -335,7 +386,7 @@ function generateContentsFile(courseStructure, outputDir) {
 }
 
 // Download transcripts
-async function downloadTranscripts(browser, courseUrl, courseStructure, downloadSrt, tabCount = 5) {
+async function downloadTranscripts(browser, courseUrl, courseStructure, downloadSrt, tabCount = 5, languages = null) {
   const allLectures = [];
 
   // Flatten all lectures into a single list
@@ -366,7 +417,7 @@ async function downloadTranscripts(browser, courseUrl, courseStructure, download
 
     for (let i = 0; i < chunk.length; i++) {
       const { lecture, chapter } = chunk[i];
-      await processLecture(page, courseUrl, lecture, chapter, downloadSrt);
+      await processLecture(page, courseUrl, lecture, chapter, downloadSrt, languages);
     }
 
     await page.close();
@@ -375,7 +426,7 @@ async function downloadTranscripts(browser, courseUrl, courseStructure, download
 }
 
 // Process a single lecture
-async function processLecture(page, courseUrl, lecture, chapter = null, downloadSrt = false) {
+async function processLecture(page, courseUrl, lecture, chapter = null, downloadSrt = false, languages = null) {
   const lectureUrl = `${courseUrl}learn/lecture/${lecture.id}`;
   const filename = chapter ?
     `${chapter.index}.${lecture.lectureIndex} ${lecture.title}` :
@@ -502,7 +553,16 @@ async function processLecture(page, courseUrl, lecture, chapter = null, download
 
     // Optional: Download SRT files if captions are available
     if (downloadSrt && Array.isArray(lecture.captions) && lecture.captions.length > 0) {
-      for (const caption of lecture.captions) {
+      // Filter captions by specified languages if provided
+      const captionsToDownload = languages
+        ? lecture.captions.filter(c => languages.includes(c.locale_id))
+        : lecture.captions;
+
+      if (languages && captionsToDownload.length === 0) {
+        console.log(`  No captions match language filter [${languages.join(', ')}] for: ${sanitizedFilename}`);
+      }
+
+      for (const caption of captionsToDownload) {
         try {
           const vttContent = await page.evaluate(async (url) => {
             const res = await fetch(url);

@@ -51,6 +51,20 @@ Or use the direct Node.js command:
 node src/index.js "https://www.udemy.com/course/your-course-url/"
 ```
 
+### Filter languages for SRT download
+
+You can use the `--languages` (or `-l`) flag to download only specific subtitle languages:
+
+```
+npm start "https://www.udemy.com/course/your-course-url/" --languages en_GB,zh_CN
+```
+
+```
+node src/index.js "https://www.udemy.com/course/your-course-url/" -l en_GB,zh_CN
+```
+
+When `--languages` is specified, SRT download is automatically enabled, and only the specified language codes will be downloaded.
+
 The script will:
 
 1. Ask if you want to download `.srt` files (with timestamps) for each lecture
